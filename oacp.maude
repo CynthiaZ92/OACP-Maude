@@ -1,0 +1,753 @@
+---assumptions:
+---leader dies gracefully (passes responsibility to another node then becomes follower)
+-----leader never has to handle someone else being leader (always 1 leader)
+---all nodes respond, even when down
+---no messages destroyed
+
+---module for grow-only set
+mod GSET_NAT is
+  pr NAT .
+  sorts GSet Elt Magma .
+  subsorts GSet < Elt < Magma .
+  subsorts Nat < Elt .
+
+  op mt : -> GSet [ctor].                  --- empty set
+  op _,_ : Magma Magma -> Magma [assoc comm] .
+  op {_} : Magma -> GSet .
+
+  vars L M : Magma .
+  vars E F : Elt .
+  vars S T : GSet .
+
+  --- eliminate duplicate elements
+    eq { L , L , M } = { L , M } .
+    eq { L , L } = { L } .
+
+  *** (membership
+    op _in_ : Elt Set -> Bool .
+    eq E in mt = false .
+    eq E in { F } = (E == F) .
+    eq E in { F , L }
+      = if E == F then true else E in { L } fi .)
+
+  --- set union
+    ops _U_ : GSet GSet -> GSet [assoc comm] .
+    eq S U mt = S .
+    eq { L } U { M } = { L , M } .
+
+  *** (set difference
+    op _\_ : GSet GSet -> GSet .
+    eq mt \ S = mt .
+    eq { E } \ S = if E in S then mt else { E } fi .
+    eq { E , L } \ S = ({ E } \ S) U ({ L } \ S) .)
+endm
+
+---simplifications
+---appendentry -> setlog
+---new leader election
+mod LEDGER is
+  --- index, term, CRDT state and command form an entry
+  --- list of entries form a ledger
+  pr STRING .
+  pr NAT .
+  pr BOOL .
+  pr GSET_NAT .
+  sorts Command Entry Ledger .
+  subsort String < Command .
+  subsort Entry < Ledger .
+  op entry : Nat Nat GSet Command -> Entry [ctor] .
+  op empty : -> Ledger [ctor] .
+  op _;_ : Ledger Ledger -> Ledger [ctor assoc id: empty] .
+  --- indexing
+  vars L1 L2 : Ledger .
+  vars ind ter : Nat .
+  var cState : GSet .
+  var C : Command .
+
+  --- unused
+  --- op _[_] : Ledger Nat -> Entry .
+  --- eq (L1 ; entry(ind, ter, cState, C) ; L2) [ind] = entry(ind, ter, cState, C) .
+
+  --- check ledger contains entry
+  var E E1 E2 : Entry .
+  op contains : Ledger Entry -> Bool .
+  eq contains(L1 ; E ; L2, E) = true .
+  eq contains(L1, E) = false [owise] .
+
+  --- update entries state
+  var upGSet : GSet .
+  op updateLedger _[_] _ : Ledger Nat GSet -> Ledger  .
+  eq updateLedger (L1 ; entry(ind, ter, cState, C); L2)[ind] upGSet = (L1 ; entry(ind, ter, upGSet, C); L2) .
+
+  --- get top of ledger
+  op head : Ledger -> Entry .
+  eq head(L1 ; E) = E .
+
+  --- helpers
+  op index : Entry -> Nat .
+  op term : Entry -> Nat .
+  op command : Entry -> Command .
+  op cstate : Entry -> GSet .
+  eq index(entry(ind, ter, cState, C)) = ind .
+  eq term(entry(ind, ter, cState, C)) = ter .
+  eq command(entry(ind, ter, cState, C)) = C .
+  eq cstate(entry(ind, ter, cState, C)) = cState .
+
+  --- check if E1 <= E2, so E2 is at least as up to date as E1
+  op compare-log : Entry Entry -> Bool .
+  eq compare-log(E1, E2) = term(E1) < term(E2) or (term(E1) == term(E2) and index(E1) <= index(E2)) .
+endm
+
+mod MESSAGE is
+  ex CONFIGURATION .
+  pr LEDGER .
+  pr NAT .
+  pr BOOL .
+  pr GSET_NAT .
+  sort MsgCont .
+  --- crdt update
+  op UpdateCRDT : Elt -> MsgCont [ctor] .
+  --- crdt update bar
+  op UpdateBarCRDT : Elt -> MsgCont [ctor] .
+  --- melt
+  op Melt : -> MsgCont [ctor] .
+  ---meltbar
+  op MeltBar : -> MsgCont [ctor] .
+  ---freeze and merge
+  op Freeze : -> MsgCont [ctor] .
+  ---merge response
+  op FreezeResponse : GSet -> MsgCont [ctor] .
+  --- for leader
+  op Query : Command -> MsgCont [ctor] .
+  --- the nat of the next three commands is the current term
+  --- send the ledger to followers
+  op SetLog : Nat Ledger -> MsgCont [ctor] .
+  --- vote yes if log updated, no otherwise (if node is down or setlog came from dead leader)
+  op SetLogResponse : Nat Bool -> MsgCont [ctor] .
+  --- tell nodes to commit up to the designated entry (if entry doesn't exist, do nothing)
+  op Commit : Nat Entry -> MsgCont [ctor] .
+  --- tell a node to die
+  op Die : -> MsgCont [ctor] .
+  --- tell a node to come online
+  op Live : -> MsgCont [ctor] .
+  --- tell a node to try to become leader for specified term
+  op BecomeLeader : Nat -> MsgCont [ctor] .
+  --- request a vote from a node, giving the term and ledger of the candidate
+  op RequestVote : Nat Entry -> MsgCont [ctor] .
+  --- if the logs have latest entries with different terms, the higher term is more up-to-date.
+  --- otherwise, the higher index is more up-to-date
+  --- Vote yes (true) if candidate is at least as up-to-date and not offline, no otherwise
+  op Vote : Nat Bool -> MsgCont [ctor] .
+
+  op msg_from_to_ : MsgCont Oid Oid -> Msg [ctor] .
+
+  op dest : Msg -> Oid .
+  op cont : Msg -> MsgCont .
+  var C : MsgCont .
+  vars O O2 : Oid .
+  eq dest(msg C from O to O2) = O2 .
+  eq cont(msg C from O to O2) = C .
+endm
+
+mod MULTICAST is
+  pr MESSAGE .
+  --- send message to multiple nodes at once
+  sort OidSet .
+  subsort Oid < OidSet .
+  op none : -> OidSet [ctor] .
+  op multicast_from_to_ : MsgCont Oid OidSet -> Msg [ctor] .
+  op _,_ : OidSet OidSet -> OidSet [ctor assoc comm id: none] .
+  var M : MsgCont .
+  vars O O2 : Oid .
+  var OS : OidSet .
+  eq multicast M from O to none = none .
+  eq multicast M from O to (O2 , OS) = (msg M from O to O2) multicast M from O to OS .
+endm
+
+mod NODE is
+  pr MESSAGE .
+  pr MULTICAST .
+  pr STRING .
+  pr NAT .
+  pr LEDGER .
+  pr BOOL .
+  pr GSET_NAT .
+
+  sort NodeCid .
+  subsort NodeCid < Cid .
+  op node : Nat -> Oid [ctor] .
+  op FollowerNode : -> NodeCid .
+  op LeaderNode : -> NodeCid .
+  op OfflineNode : -> NodeCid .
+  op CandidateNode : -> NodeCid .
+
+  --- term of node. starts at 0. 1 term corresponds to 1 election
+  op currentTerm :_ : Nat -> Attribute [ctor gather(&)] .
+  --- current ledger
+  op log :_ : Ledger -> Attribute [ctor gather(&)] .
+  --- committed commands (relfected on state machine)
+  op committed :_ : Ledger -> Attribute [ctor gather(&)] .
+  --- CRDT state
+  op crdtState :_ : GSet -> Attribute [ctor gather(&)] .
+  --- other nodes
+  op neighbors :_ : OidSet -> Attribute [ctor gather(&)] .
+  --- frozen flag for crdt operations
+  op frozen :_ : Bool -> Attribute [ctor gather(&)] .
+  --- whether leader is waiting for nodes freeze
+  op freezewaiting :_ : Bool -> Attribute [ctor gather(&)] .
+  --- whether leader is waiting for nodes setlog
+  op waiting :_ : Bool -> Attribute [ctor gather(&)] .
+  --- next neighbor in ring
+  op next-neighbor :_ : Oid -> Attribute [ctor gather(&)] .
+  --- value for majority of nodes
+  op majority :_ : Nat -> Attribute [ctor gather(&)] .
+  --- number of neighbors (static)
+  op number-neighbors :_ : Nat -> Attribute [ctor gather(&)] .
+  --- number of yes response (election or commit)
+  op number-yes :_ : Nat -> Attribute [ctor gather(&)] .
+  --- number of no responses
+  op number-response :_ : Nat -> Attribute [ctor gather(&)] .
+
+  op to-nat : Bool -> Nat .
+  eq to-nat(false) = 0 .
+  eq to-nat(true) = 1 .
+
+  --- cleanup for each object
+  var O : Oid .
+  var C : NodeCid .
+  var N : Nat .
+  var M : Msg .
+  var MC : MsgCont .
+  var AS : AttributeSet .
+  var led : Ledger .
+  var E : Entry .
+  var B : Bool .
+
+  --- get the term of a message content, used for cleanup
+  op get-term : MsgCont -> Nat .
+  eq get-term(SetLog(N, led)) = N .
+  eq get-term(SetLogResponse(N, B)) = N .
+  eq get-term(Commit(N, E)) = N .
+  eq get-term(RequestVote(N, E)) = N .
+  eq get-term(Vote(N, B)) = N .
+
+  --- delete a message if the term of its contents is less than the term of the object
+  ceq
+    (M)
+    < O : C | currentTerm : N, AS > =
+    < O : C | currentTerm : N, AS >
+    if N > get-term(cont(M)) /\ dest(M) == O .
+endm
+
+mod LEADER is
+  --- a leader node handles incoming queries and replication
+  pr NODE .
+
+  var C : Command .
+  var up : Elt .
+  var CRDT : GSet .
+  var gset : GSet .
+  var oids : OidSet .
+  var cli lea fol : Oid .
+  var fols : OidSet .
+  var led led' comled : Ledger .
+  var AS : AttributeSet .
+  var N1 N2 N3 term term-res : Nat .
+  var B : Bool .
+  var M : Msg .
+  var E : Entry .
+
+  --- when receive an update, when it's not frozen, update crdt state
+  rl [update-crdt-leader] :
+    (msg UpdateCRDT(up) from cli to lea)
+    < lea : LeaderNode | crdtState : CRDT, neighbors : fols, frozen : false, AS > =>
+    < lea : LeaderNode | crdtState : CRDT U {up}, neighbors : fols, frozen : false, AS >
+    (multicast UpdateBarCRDT(up) from lea to fols) .
+
+  rl [updatebar-crdt-leader] :
+    (msg UpdateBarCRDT(up) from cli to lea)
+    < lea : LeaderNode | crdtState : CRDT, neighbors : fols, frozen : false, AS > =>
+    < lea : LeaderNode | crdtState : CRDT U {up}, neighbors : fols, frozen : false, AS > .
+
+  rl [melt-leader] :
+    (msg Melt from cli to lea)
+    < lea : LeaderNode | crdtState : CRDT, neighbors : fols, frozen : true, AS > =>
+    < lea : LeaderNode | crdtState : CRDT, neighbors : fols, frozen : false, AS >
+    (multicast MeltBar from lea to fols) .
+
+  rl [meltbar-leader] :
+    (msg MeltBar from fol to lea)
+    < lea : LeaderNode | crdtState : CRDT, frozen : true, AS > =>
+    < lea : LeaderNode | crdtState : CRDT, frozen : false, AS > .
+
+  --- when given a query, first merge crdt state, then add to log and send to all other nodes
+  rl [freeze-leader] :
+    (msg Freeze from cli to lea)
+    < lea : LeaderNode | currentTerm : term, log : led , neighbors : fols, crdtState : CRDT, frozen : false, freezewaiting : false, number-response : N2, AS > =>
+    < lea : LeaderNode | currentTerm : term, log : led , neighbors : fols, crdtState : CRDT, frozen : true, freezewaiting : true, number-response : N2, AS >
+    (multicast Freeze from lea to fols) .
+
+  rl [freeze-response-leader] :
+    (msg FreezeResponse(gset) from fol to lea)
+    < lea : LeaderNode | currentTerm : term, log : led , neighbors : fols, crdtState : CRDT, frozen : true, freezewaiting : true, number-response : N2, AS > =>
+    < lea : LeaderNode | currentTerm : term, log : led , neighbors : fols, crdtState : CRDT U gset, frozen : true, freezewaiting : true, number-response : N2 + 1, AS > .
+
+  rl [freeze-done-leader] :
+    < lea : LeaderNode | currentTerm : term, log : led , neighbors : fols, crdtState : CRDT, frozen : true, freezewaiting : true, number-response : N3, number-neighbors : N3, AS > =>
+    < lea : LeaderNode | currentTerm : term, log : led , neighbors : fols, crdtState : CRDT, frozen : true, freezewaiting : false, number-response : N3, number-neighbors : N3, AS > .
+
+  rl [query-leader] :
+    (msg Query(C) from cli to lea)
+    < lea : LeaderNode | currentTerm : term, log : led , neighbors : fols, crdtState : CRDT, frozen : true, waiting : false, freezewaiting : false, number-yes : N1, number-response : N2, AS > =>
+    < lea : LeaderNode | currentTerm : term, log : led', neighbors : fols, crdtState : CRDT, frozen : true, waiting : true , freezewaiting : false, number-yes : 1 , number-response : 0 , AS >
+    (multicast SetLog(term, led') from lea to fols)
+    if led' := led ; entry(index(head(led)) + 1, term, CRDT, C) .
+
+  --- acknowledge that log was updated
+  rl [set-log-response-leader] :
+    (msg SetLogResponse(term, B) from fol to lea)
+    < lea : LeaderNode | currentTerm : term, log : led, number-yes : N1, number-response : N2, AS > =>
+    < lea : LeaderNode | currentTerm : term, log : led', number-yes : N1 + to-nat(B), number-response : N2 + 1, AS > .
+
+  --- when everyone responds, commit if majority said yes, retry if not
+  crl [commit] :
+    < lea : LeaderNode | currentTerm : term, waiting : true , neighbors : oids, log : led, committed : comled, majority : N1, number-yes : N2, number-neighbors : N3, number-response : N3, AS > =>
+    < lea : LeaderNode | currentTerm : term, waiting : false, neighbors : oids, log : led, committed : led   , majority : N1, number-yes : N2, number-neighbors : N3, number-response : N3, AS >
+    (multicast Commit(term, head(led)) from lea to oids)
+    if N2 >= N1 .
+
+  --- retry the setlog message - note, this should never occur if a majority of nodes are online!
+  crl [retry] :
+    < lea : LeaderNode | currentTerm : term, neighbors : oids, log : led, majority : N1, number-yes : N2, number-neighbors : N3, number-response : N3, AS > =>
+    < lea : LeaderNode | currentTerm : term, neighbors : oids, log : led, majority : N1, number-yes : 1 , number-neighbors : N3, number-response : 0 , AS >
+    (multicast SetLog(term, led) from lea to oids)
+    if N2 < N1 .
+
+  --- tell the next node to start leader process and become offline
+  rl [die] :
+    (msg Die from cli to lea)
+    < lea : LeaderNode  | currentTerm : term, next-neighbor : fol, AS > =>
+    < lea : OfflineNode | currentTerm : term, next-neighbor : fol, AS >
+    (msg Die from lea to cli)
+    (msg BecomeLeader(term + 1) from lea to fol) .
+endm
+
+mod OFFLINE is
+  --- an offline does nothing but respond with negative votes and propegate leader requests and queries.
+  pr NODE .
+  var C : Command .
+  var oids : OidSet .
+  var O1 O2 cli lea fol : Oid .
+  var fols : OidSet .
+  var led comled : Ledger .
+  var AS : AttributeSet .
+  var N1 N2 N3 term term-res : Nat .
+  var B : Bool .
+  var E : Entry .
+  var up : Elt .
+  var CRDT : GSet .
+  var gset : GSet .
+
+  --- when receive an update, when it's not frozen, update crdt state
+  rl [update-crdt-offline] :
+    (msg UpdateCRDT(up) from cli to O1)
+    < O1 : OfflineNode | next-neighbor : lea, frozen : false, AS > =>
+    < O1 : OfflineNode | next-neighbor : lea, frozen : false, AS >
+    (msg UpdateCRDT(up) from cli to lea) .
+
+  rl [updatebar-crdt-offline] :
+    (msg UpdateBarCRDT(up) from cli to O1)
+    < O1 : OfflineNode | next-neighbor : lea, frozen : false, AS > =>
+    < O1 : OfflineNode | next-neighbor : lea, frozen : false, AS >
+    (msg UpdateBarCRDT(up) from cli to lea) .
+
+  rl [freeze-offline] :
+    (msg Freeze from lea to O1)
+    < O1 : OfflineNode | next-neighbor : fol, frozen : false, AS > =>
+    < O1 : OfflineNode | next-neighbor : fol, frozen : false, AS >
+    (msg Freeze from lea to fol) .
+
+  rl [melt-offline] :
+    (msg Melt from cli to O1)
+    < O1 : OfflineNode | next-neighbor : lea, frozen : true, AS > =>
+    < O1 : OfflineNode | next-neighbor : lea, frozen : true, AS >
+    (msg Melt from cli to lea) .
+
+  rl [meltbar-offline] :
+    (msg MeltBar from cli to O1)
+    < O1 : OfflineNode | next-neighbor : lea, frozen : true, AS > =>
+    < O1 : OfflineNode | next-neighbor : lea, frozen : true, AS >
+    (msg MeltBar from cli to lea) .
+
+  --- propagate query
+  rl [query-offline] :
+    (msg Query(C) from cli to fol)
+    < fol : OfflineNode | next-neighbor : lea, AS > =>
+    < fol : OfflineNode | next-neighbor : lea, AS >
+    (msg Query(C) from cli to lea) .
+
+  --- vote no on setting log
+  rl [set-log-offline] :
+    (msg SetLog(term, led) from lea to fol)
+    < fol : OfflineNode | crdtState : CRDT, AS > =>
+    < fol : OfflineNode | crdtState : CRDT, AS >
+    (msg SetLogResponse(term, false) from fol to lea) .
+
+  --- ignore setlogresponse
+  rl [set-log-response-offline] :
+    (msg SetLogResponse(term, B) from fol to lea)
+    < lea : OfflineNode | AS > =>
+    < lea : OfflineNode | AS > .
+
+  --- don't commit
+  rl [commit-offline] :
+    (msg Commit(term, E) from lea to fol)
+    < fol : OfflineNode | AS > =>
+    < fol : OfflineNode | AS > .
+
+  ---become follower node
+  rl [come-online] :
+    (msg Live from cli to fol)
+    < fol : OfflineNode | AS > =>
+    < fol : FollowerNode | AS >
+    (msg Live from fol to cli) .
+
+  --- forward leader request
+  rl [leader-offline] :
+    (msg BecomeLeader(term) from lea to O1)
+    < O1 : OfflineNode | next-neighbor : O2, AS > =>
+    < O1 : OfflineNode | next-neighbor : O2, AS >
+    (msg BecomeLeader(term) from O1 to O2) .
+
+  --- vote no if asked
+  rl [request-vote-offline] :
+    (msg RequestVote(term, E) from lea to fol)
+    < fol : OfflineNode | AS > =>
+    < fol : OfflineNode | AS >
+    (msg Vote(term, false) from fol to lea) .
+
+  --- eat residual votes
+  rl [request-vote-offline] :
+    (msg Vote(term, B) from lea to fol)
+    < fol : OfflineNode | AS > =>
+    < fol : OfflineNode | AS > .
+
+  --- delete setlogresponse messages
+  rl [follower-set-log-response] :
+    (msg SetLogResponse(term, B) from lea to fol)
+    < fol : OfflineNode | AS > =>
+    < fol : OfflineNode | AS > .
+endm
+
+mod FOLLOWER is
+  --- a follower node is the most usual state - they wait for a message (commit, become leader, etc) and respond or change accordingly
+  pr NODE .
+  var C : Command .
+  var oids : OidSet .
+  var cli lea fol : Oid .
+  var fols : OidSet .
+  vars led led2 oldled comled : Ledger .
+  var AS : AttributeSet .
+  var N1 N2 N3 term new-term term-res : Nat .
+  var E E1 E2 : Entry .
+  var M : Msg .
+  var B : Bool .
+  var up : Elt .
+  var CRDT : GSet .
+  var gset : GSet .
+
+  --- when receive an update, when it's not frozen, update crdt state
+  rl [update-crdt-follower] :
+    (msg UpdateCRDT(up) from cli to fol)
+    < fol : FollowerNode | crdtState : CRDT, neighbors : fols, frozen : false, AS > =>
+    < fol : FollowerNode | crdtState : CRDT U {up}, neighbors : fols, frozen : false, AS >
+    (multicast UpdateBarCRDT(up) from fol to fols) .
+
+  rl [updatebar-crdt-follower] :
+    (msg UpdateBarCRDT(up) from fol to lea)
+    < fol : FollowerNode | crdtState : CRDT, frozen : false, AS > =>
+    < fol : FollowerNode | crdtState : CRDT U {up}, frozen : false, AS > .
+
+  rl [melt-follower] :
+    (msg Melt from lea to fol)
+    < fol : FollowerNode | frozen : true, neighbors : fols, AS > =>
+    < fol : FollowerNode | frozen : false, neighbors : fols,  AS >
+    (multicast MeltBar from fol to fols) .
+
+  rl [meltbar-follower] :
+    (msg MeltBar from cli to fol)
+    < fol : FollowerNode | frozen : true, AS > =>
+    < fol : FollowerNode | frozen : false, AS > .
+
+  rl [freeze-follower] :
+    (msg Freeze from lea to fol)
+    < fol : FollowerNode | frozen : false, crdtState : CRDT, AS > =>
+    < fol : FollowerNode | frozen : true, crdtState : CRDT, AS >
+    (multicast FreezeResponse(CRDT) from fol to lea) .
+
+  --- propagate query
+  rl [query-follower] :
+    (msg Query(C) from cli to fol)
+    < fol : FollowerNode | next-neighbor : lea, AS > =>
+    < fol : FollowerNode | next-neighbor : lea, AS >
+    (msg Query(C) from cli to lea) .
+
+  --- set the log of the leader
+  crl [set-log-follower] :
+    (msg SetLog(new-term, led) from lea to fol)
+    < fol : FollowerNode | currentTerm : term    , crdtState : CRDT, log : oldled, AS > =>
+    < fol : FollowerNode | currentTerm : new-term, crdtState : CRDT, log : led, AS >
+    (msg SetLogResponse(new-term, true) from fol to lea)
+    if new-term >= term .
+
+  --- commit up to entry E if not committed (and update state machine with led ; E, if modeled)
+  crl [commit-follower] :
+    (msg Commit(new-term, E) from lea to fol)
+    < fol : FollowerNode | currentTerm : term    , log : comled ; led ; E ; led2, committed : comled          , AS > =>
+    < fol : FollowerNode | currentTerm : new-term, log : comled ; led ; E ; led2, committed : comled ; led ; E, AS >
+    if new-term >= term .
+
+  --- if log doesn't have E or E is already committed, ignore
+  crl [cant-commit-follower] :
+    (msg Commit(new-term, E) from lea to fol)
+    < fol : FollowerNode | currentTerm : term    , log : led, committed : comled, AS > =>
+    < fol : FollowerNode | currentTerm : new-term, log : led, committed : comled, AS >
+    if (new-term >= term) and ((not contains(led, E)) or (contains(comled, E))) .
+
+  --- go offline
+  rl [die] :
+    (msg Die from cli to fol)
+    < fol : FollowerNode | AS > =>
+    < fol : OfflineNode  | AS >
+    (msg Die from fol to cli) .
+
+  --- delete setlogresponse messages
+  rl [follower-set-log-response] :
+    (msg SetLogResponse(term, B) from lea to fol)
+    < fol : FollowerNode | AS > =>
+    < fol : FollowerNode | AS > .
+
+  --- delete vote messages
+  rl [follower-vote-result] :
+    (msg Vote(term, B) from lea to fol)
+    < fol : FollowerNode | AS > =>
+    < fol : FollowerNode | AS > .
+
+  --- send new term and last entry to request vote
+  rl [become-leader] :
+    (msg BecomeLeader(new-term) from lea to fol)
+    < fol : FollowerNode  | currentTerm : term    , log : led ; E, neighbors : fols, number-yes : N1, number-response : N2, AS > =>
+    < fol : CandidateNode | currentTerm : new-term, log : led ; E, neighbors : fols, number-yes : 1 , number-response : 0 , AS >
+    (multicast RequestVote(new-term, E) from fol to fols) .
+
+  --- vote yes if log not as up-to-date
+  crl [follower-vote] :
+    (msg RequestVote(new-term, E2) from lea to fol)
+    < fol : FollowerNode | currentTerm : term    , log : led ; E1, AS > =>
+    < fol : FollowerNode | currentTerm : new-term, log : led ; E1, AS >
+    (msg Vote(new-term, compare-log(E1, E2)) from fol to lea)
+    if (new-term >= term) .
+endm
+
+mod CANDIDATE is
+  --- a candidate node sends request votes to other nodes and waits for responses
+  pr NODE .
+  var C : Command .
+  var oids : OidSet .
+  var cli lea fol : Oid .
+  var fols : OidSet .
+  vars led led2 oldled comled : Ledger .
+  var AS : AttributeSet .
+  var N1 N2 N3 term new-term term-res : Nat .
+  var E : Entry .
+  var M : Msg .
+  var B : Bool .
+  var up : Elt .
+  var CRDT : GSet .
+  var gset : GSet .
+
+  --- when receive an update, when it's not frozen, update crdt state
+  rl [update-crdt-candidate] :
+    (msg UpdateCRDT(up) from cli to lea)
+    < lea : CandidateNode | crdtState : CRDT, neighbors : fols, frozen : false, AS > =>
+    < lea : CandidateNode | crdtState : CRDT U {up}, neighbors : fols, frozen : false, AS >
+    (multicast UpdateBarCRDT(up) from cli to fols) .
+
+  rl [updatebar-crdt-candidate] :
+    (msg UpdateBarCRDT(up) from fol to lea)
+    < lea : CandidateNode | crdtState : CRDT, frozen : false, AS > =>
+    < lea : CandidateNode | crdtState : CRDT U {up}, frozen : false, AS > .
+
+  rl [melt-candidate] :
+    (msg Melt from cli to lea)
+    < lea : CandidateNode | frozen : true, neighbors : fols, AS > =>
+    < lea : CandidateNode | frozen : false, neighbors : fols,  AS >
+    (multicast MeltBar from lea to fols) .
+
+  rl [meltbar-candidate] :
+    (msg MeltBar from cli to lea)
+    < lea : CandidateNode | frozen : true, AS > =>
+    < lea : CandidateNode | frozen : false, AS > .
+
+  rl [freeze-candidate] :
+    (msg Freeze from lea to fol)
+    < fol : FollowerNode | frozen : false, crdtState : CRDT, AS > =>
+    < fol : FollowerNode | frozen : true, crdtState : CRDT, AS >
+    (multicast FreezeResponse(CRDT) from fol to lea) .
+
+  --- receive yes or not vote
+  rl [candidate-receive-vote] :
+    (msg Vote(term, B) from fol to lea)
+    < lea : CandidateNode | currentTerm : term, number-yes : N1            , number-response : N2    , AS > =>
+    < lea : CandidateNode | currentTerm : term, number-yes : N1 + to-nat(B), number-response : N2 + 1, AS > .
+
+  --- when everyone responds, become leader and propegate log if majority voted yes
+  crl [success-leader] :
+    < lea : CandidateNode | currentTerm : term, log : led, neighbors : fols, waiting : B   , majority : N1, number-yes : N2, number-neighbors : N3, number-response : N3, AS > =>
+    < lea : LeaderNode    | currentTerm : term, log : led, neighbors : fols, waiting : true, majority : N1, number-yes : 1 , number-neighbors : N3, number-response : 0 , AS >
+    (multicast SetLog(term, led) from lea to fols)
+    if N2 >= N1 .
+
+  --- when everyone responds, if failed, pass on leader request
+  crl [fail-leader] :
+    < lea : CandidateNode | currentTerm : term, next-neighbor : fol, majority : N1, number-yes : N2, number-neighbors : N3, number-response : N3, AS > =>
+    < lea : FollowerNode  | currentTerm : term, next-neighbor : fol, majority : N1, number-yes : N2, number-neighbors : N3, number-response : N3, AS >
+    (msg BecomeLeader(term + 1) from lea to fol)
+    if N2 < N1 .
+
+  --- tell the next node to start leader process and become offline
+  rl [die] :
+    (msg Die from cli to lea)
+    < lea : CandidateNode | currentTerm : term, next-neighbor : fol, AS > =>
+    < lea : OfflineNode   | currentTerm : term, next-neighbor : fol, AS >
+    (msg Die from lea to cli)
+    (msg BecomeLeader(term + 1) from lea to fol) .
+endm
+
+mod NODE-INIT is
+  pr FOLLOWER .
+  pr LEADER .
+  pr OFFLINE .
+  pr CANDIDATE .
+
+  --- first parameter is index, second is number of nodes
+  op init-node : Nat Nat -> Configuration .
+  op make-neighbors : Nat Nat -> OidSet .
+  op add-one-modulo : Nat Nat -> Nat .
+  op get-majority : Nat -> Nat .
+  op get-minority : Nat -> Nat .
+  vars N N1 N2 : Nat .
+
+  --- helper methods to define node properties
+  eq make-neighbors(0, 0) = none .
+  eq make-neighbors(s N, 0) = node(0) .
+  eq make-neighbors(s N, s N) = make-neighbors(s N, N) .
+  eq make-neighbors(N2, s N) = node(s N), make-neighbors(N2, N) [owise] .
+
+  eq add-one-modulo(N1, s N1) = 0 .
+  eq add-one-modulo(N1, N2) = s N1 [owise] .
+
+  eq get-majority(s s N1) = 1 + get-majority(N1) .
+  eq get-majority(N1) = 1 [owise] .
+  eq get-minority(s s s N1) = 1 + get-minority(s N1) .
+  eq get-minority(N1) = 0 [owise] .
+
+  --- initialize node with index N1 in total of N2 nodes
+  eq init-node(N1, s N2) =
+    < node(N1) : FollowerNode | currentTerm : 0,
+                                log : entry(0, 0, mt, "startup"),
+                                committed : entry(0, 0, mt, "startup"),
+                                neighbors : make-neighbors(N1, N2),
+                                frozen : false,
+                                waiting : false,
+                                next-neighbor : node(add-one-modulo(N1, s N2)),
+                                majority : get-majority(s N2),
+                                number-neighbors : N2,
+                                number-yes : 1,
+                                number-response : 0 > .
+  op init-ring : Nat -> Configuration .
+  op init-ring : Nat Nat -> Configuration .
+  eq init-ring(N) = init-ring(0, N) .
+  eq init-ring(N, N) = none .
+  eq init-ring(N1, N2) = init-node(N1, N2) init-ring(N1 + 1, N2) [owise] .
+endm
+
+mod SIMUL is
+  pr NODE-INIT .
+
+  op Client : -> Cid [ctor] .
+  op client : -> Oid [ctor] .
+
+  sort command-list .
+  op empty : -> command-list [ctor] .
+  subsort Command < command-list .
+  op _;_ : command-list command-list -> command-list [ctor assoc id: empty] .
+
+  --- total amount of failures left
+  op gas :_ : Nat -> Attribute [ctor gather(&)] .
+  --- number of nodes that can still be failed
+  op num :_ : Nat -> Attribute [ctor gather(&)] .
+  --- nodes that are alive
+  op live :_ : OidSet -> Attribute [ctor gather(&)] .
+  --- nodes that are failed
+  op fail :_ : OidSet -> Attribute [ctor gather(&)] .
+
+  var g N N2 : Nat .
+  var O cli : Oid .
+  var OS failed : OidSet .
+  var AS : AttributeSet .
+  op init-client : Nat Nat -> Configuration .
+  eq init-client(s N, g) =
+    (msg BecomeLeader(1) from client to node(0))
+    (msg Freeze from client to node(0))
+    (msg Query("cmd1") from client to node(0))
+    (msg Melt from client to node(0))
+    (msg UpdateCRDT(1) from client to node(1))
+    (msg UpdateCRDT(2) from client to node(2))
+    (msg Freeze from client to node(0))
+    (msg Query("cmd2") from client to node(0))
+    (msg Melt from client to node(0))
+    (msg UpdateCRDT(3) from client to node(2))
+    (msg Freeze from client to node(0))
+    (msg Query("cmd3") from client to node(0))
+    (msg Melt from client to node(0))
+    < client : Client | gas : g, num : get-minority(s N), live : make-neighbors(s N, N), fail : none > .
+
+  --- tell a node to die
+  rl [cause-die] :
+    < cli : Client | gas : s N2, num : s N, live : (O, OS), AS > =>
+    < cli : Client | gas :   N2, num : N  , live : OS     , AS >
+    (msg Die from cli to O) .
+
+  --- acknowledge node death
+  rl [eat-die] :
+    (msg Die from O to cli)
+    < cli : Client | fail : failed     , AS > =>
+    < cli : Client | fail : (O, failed), AS > .
+
+  --- bring node back to life
+  rl [cause-live] :
+    < cli : Client | fail : (O, failed), AS > =>
+    < cli : Client | fail : failed     , AS >
+    (msg Live from cli to O) .
+
+  --- acknowledge node life
+  rl [eat-live] :
+    (msg Live from O to cli)
+    < cli : Client | num : N  , live : OS     , AS > =>
+    < cli : Client | num : s N, live : (O, OS), AS > .
+
+  op init : Nat Nat -> Configuration .
+  eq init(N, g) = init-client(N, g) init-ring(N) .
+endm
+
+
+set trace on .
+set trace mb off .
+set trace eq off .
+set trace condition off .
+
+search [1] init(3, 1) =>* C:Configuration
+                      < O1:Oid : C1:Cid | committed : L11:Ledger ; entry(ind:Nat, term:Nat, cState1:GSet, C:Command) ; L12:Ledger, AS1:AttributeSet >
+                      < O2:Oid : C2:Cid | committed : L21:Ledger ; entry(ind:Nat, term:Nat, cState2:GSet, C:Command) ; L22:Ledger, AS2:AttributeSet >
+                      such that cState1:GSet =/= cState2:GSet or L11:Ledger =/= L21:Ledger .
