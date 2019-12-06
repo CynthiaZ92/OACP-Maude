@@ -303,19 +303,11 @@ mod LEADER is
     < lea : LeaderNode | neighbors : fols, frozen : false, waiting : false, AS >
     (multicast Melt from lea to fols) .
 
-  ***(rl [freeze-leader] :
+  rl [freeze-leader] :
     (msg Freeze from cli to lea)
     < lea : LeaderNode | neighbors : fols, frozen : false, freezewaiting : false, number-response : N2, command-order : CL, AS > =>
     < lea : LeaderNode | neighbors : fols, frozen : true,  freezewaiting : true, number-response : N2, command-order : CL, AS >
-    (multicast Freeze from lea to fols) .)
-    rl [freeze-*] :
-    (msg Freeze from cli to lea)
-    < lea : LeaderNode | neighbors : fols, frozen : false, freezewaiting : false, number-response : N2, command-order : CL, AS >
-    <lea : LeaderNode | neighbors : fols, frozen : false, freezewaiting : false, number-response : N2, command-order : CL, AS>
-    <lea : LeaderNode | neighbors : fols, frozen : false, freezewaiting : false, number-response : N2, command-order : CL, AS> =>
-    < lea : LeaderNode | neighbors : fols, frozen : true,  freezewaiting : true, number-response : N2, command-order : CL, AS >
-    < lea : LeaderNode | neighbors : fols, frozen : true,  freezewaiting : true, number-response : N2, command-order : CL, AS >
-    < lea : LeaderNode | neighbors : fols, frozen : true,  freezewaiting : true, number-response : N2, command-order : CL, AS >
+    (multicast Freeze from lea to fols) .
 
   crl [freeze-response-leader] :
     (msg FreezeResponse(gset) from fol to lea)
